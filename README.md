@@ -23,8 +23,10 @@ HTTP API расписания Московского Политеха. Берё�
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+Или просто запустите `python main.py`: сервер поднимется на порту 8000.
 
 Интерактивная документация открывается по адресу `http://<сервер>:8000/docs`.
 
@@ -106,7 +108,7 @@ curl "http://localhost:8000/deadlines/231-321?date=02.11.2026&format=text"
 
 | Файл | Назначение |
 |---|---|
-| `app/main.py` | эндпоинты API |
-| `app/parser.py` | разбор расписания и поиск дедлайнов (ключевые фразы в `DEADLINE_KEYWORDS`) |
-| `app/client.py` | запросы к rasp.dmami.ru и кэш |
+| `main.py` | эндпоинты API |
+| `parser.py` | разбор расписания и поиск дедлайнов (ключевые фразы в `DEADLINE_KEYWORDS`) |
+| `client.py` | запросы к rasp.dmami.ru и кэш |
 | `tests/` | тесты, запуск: `pytest -q` |
