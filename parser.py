@@ -27,6 +27,10 @@ PARENS_RE = re.compile(r"\(([^()]*)\)")
 DATE_KEY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
+class ScheduleDataError(ValueError):
+    """Ответ источника содержит некорректную структуру или значения расписания."""
+
+
 @dataclass
 class Lesson:
     subject: str
@@ -61,19 +65,34 @@ def deadline_kind(lesson: Lesson) -> str | None:
 
 
 def _parse_date(value) -> date | None:
-    if not value:
+    if value is None or value == "":
         return None
+    if not isinstance(value, str):
+        raise ScheduleDataError("Дата занятия должна быть строкой")
     for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
         try:
             return datetime.strptime(str(value)[:10], fmt).date()
         except ValueError:
             continue
-    return None
+    raise ScheduleDataError(f"Некорректная дата занятия: {value!r}")
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ScheduleDataError("Текстовое поле занятия должно быть строкой")
+    return value.strip()
 
 
 def _rooms(item: dict) -> list[str]:
-    rooms = item.get("auditories") or []
-    return [re.sub(r"<[^>]+>", "", r.get("title", "")).strip() for r in rooms if isinstance(r, dict)]
+    rooms = item.get("auditories")
+    if rooms is None:
+        return []
+    if not isinstance(rooms, list):
+        raise ScheduleDataError("Список аудиторий должен быть массивом")
+    return [re.sub(r"<[^>]+>", "", _text(r.get("title"))).strip()
+            for r in rooms if isinstance(r, dict)]
 
 
 def parse_grid(data: dict) -> list[Lesson]:
@@ -82,31 +101,60 @@ def parse_grid(data: dict) -> list[Lesson]:
     Обычное расписание: grid[день недели][номер пары] -> [занятия].
     Расписание сессии: grid['YYYY-MM-DD'][номер пары] -> [занятия].
     """
+    if not isinstance(data, dict):
+        raise ScheduleDataError("Расписание должно быть объектом")
+    grid = data.get("grid")
+    if grid is None:
+        return []
+    if not isinstance(grid, dict):
+        raise ScheduleDataError("Поле grid должно быть объектом")
     lessons = []
-    for day_key, pairs in (data.get("grid") or {}).items():
-        is_dated = bool(DATE_KEY_RE.match(str(day_key)))
+    for day_key, pairs in grid.items():
+        is_dated = bool(DATE_KEY_RE.fullmatch(str(day_key)))
+        concrete_date = _parse_date(day_key) if is_dated else None
+        weekday = None
+        if not is_dated:
+            if str(day_key) not in {str(day) for day in range(1, 8)}:
+                raise ScheduleDataError(f"Некорректный день недели: {day_key!r}")
+            weekday = int(day_key)
+        if pairs is None:
+            continue
         if isinstance(pairs, list):  # пустой день иногда приходит списком
             pairs = dict(enumerate(pairs, 1))
+        if not isinstance(pairs, dict):
+            raise ScheduleDataError("Расписание дня должно быть объектом или массивом")
         for pair_key, items in pairs.items():
+            if str(pair_key) not in {str(number) for number in PAIR_TIMES}:
+                raise ScheduleDataError(f"Некорректный номер пары: {pair_key!r}")
             pair = int(pair_key)
             start, end = PAIR_TIMES.get(pair, ("", ""))
-            for item in items or []:
-                subject = (item.get("sbj") or item.get("subject") or "").strip()
+            if items is None:
+                continue
+            if not isinstance(items, list):
+                raise ScheduleDataError("Занятия пары должны быть массивом")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ScheduleDataError("Занятие должно быть объектом")
+                subject = _text(item.get("sbj") or item.get("subject"))
                 if not subject:
                     continue
+                date_from = _parse_date(item.get("df"))
+                date_to = _parse_date(item.get("dt"))
+                if date_from and date_to and date_from > date_to:
+                    raise ScheduleDataError("Начало действия занятия позже окончания")
                 lessons.append(Lesson(
                     subject=subject,
                     pair=pair,
                     start=start,
                     end=end,
-                    teacher=(item.get("teacher") or "").strip(),
+                    teacher=_text(item.get("teacher")),
                     rooms=_rooms(item),
-                    type=(item.get("type") or "").strip(),
-                    weekday=None if is_dated else int(day_key),
-                    date_from=_parse_date(item.get("df")),
-                    date_to=_parse_date(item.get("dt")),
-                    date=_parse_date(day_key) if is_dated else None,
-                    link=item.get("e_link") or None,
+                    type=_text(item.get("type")),
+                    weekday=weekday,
+                    date_from=date_from,
+                    date_to=date_to,
+                    date=concrete_date,
+                    link=_text(item.get("e_link")) or None,
                 ))
     return lessons
 
@@ -119,10 +167,17 @@ def expand(lessons: list[Lesson], start: date, end: date) -> list[Lesson]:
             if start <= l.date <= end:
                 result.append(l)
             continue
-        d = start + timedelta(days=(l.weekday - 1 - start.weekday()) % 7)
+        if l.weekday not in range(1, 8):
+            raise ScheduleDataError("Для еженедельного занятия нужен день недели от 1 до 7")
+        offset = (l.weekday - 1 - start.weekday()) % 7
+        if offset > (end - start).days:
+            continue
+        d = start + timedelta(days=offset)
         while d <= end:
             if (not l.date_from or d >= l.date_from) and (not l.date_to or d <= l.date_to):
                 result.append(Lesson(**{**l.__dict__, "date": d}))
+            if (end - d).days < 7:
+                break
             d += timedelta(days=7)
     result.sort(key=lambda x: (x.date, x.pair))
     return result
@@ -130,7 +185,12 @@ def expand(lessons: list[Lesson], start: date, end: date) -> list[Lesson]:
 
 def clean_subject(subject: str) -> str:
     """Название предмета без скобок с типом работы: «Физика (лабораторная работа)» -> «Физика»."""
-    return re.sub(r"\s+", " ", PARENS_RE.sub("", subject)).strip() or subject
+    def remove_work_type(match):
+        text = match.group(1).lower()
+        is_work_type = any(word in text for words in DEADLINE_KEYWORDS.values() for word in words)
+        return "" if is_work_type else match.group(0)
+
+    return re.sub(r"\s+", " ", PARENS_RE.sub(remove_work_type, subject)).strip() or subject
 
 
 def find_deadlines(lessons: list[Lesson], start: date, end: date) -> list[dict]:

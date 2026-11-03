@@ -1,13 +1,14 @@
 """API расписания Московского Политеха для умной колонки ПОЛИ."""
 
+import re
 from datetime import date, datetime, timedelta
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
-from client import RaspClient, ScheduleError
-from parser import clean_subject, expand, find_deadlines, parse_grid
+from client import RaspClient, ScheduleError, ScheduleSourceError
+from parser import ScheduleDataError, clean_subject, expand, find_deadlines, parse_grid
 
 app = FastAPI(title="POLY schedule API")
 client = RaspClient()
@@ -22,11 +23,19 @@ def _load(group: str, session: bool):
     """Загружает расписание группы с сайта и разбирает его в список занятий."""
     try:
         data = client.get_group(group, session)
+        lessons = parse_grid(data)
+        group_data = data.get("group")
+        if group_data is not None and not isinstance(group_data, dict):
+            raise ScheduleDataError("Поле group должно быть объектом")
+        if group_data and group_data.get("title") is not None and not isinstance(group_data["title"], str):
+            raise ScheduleDataError("Название группы должно быть строкой")
+    except (ScheduleSourceError, ScheduleDataError) as e:
+        raise HTTPException(502, f"Некорректный ответ rasp.dmami.ru: {e}")
     except ScheduleError as e:
         raise HTTPException(404, str(e))
     except httpx.HTTPError as e:
         raise HTTPException(502, f"rasp.dmami.ru недоступен: {e}")
-    return data, parse_grid(data)
+    return data, lessons
 
 
 def _day(d: date | None) -> date:
@@ -37,6 +46,8 @@ def _day(d: date | None) -> date:
 def _parse_ddmmyyyy(value: str, name: str) -> date:
     """Разбирает дату строго в формате ДД.ММ.ГГГГ, иначе отвечает ошибкой 400."""
     try:
+        if not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", value):
+            raise ValueError("Нестрогий формат даты")
         return datetime.strptime(value, DATE_FORMAT).date()
     except ValueError:
         raise HTTPException(400, f"Параметр {name}: дата должна быть в формате ДД.ММ.ГГГГ, получено «{value}»")
@@ -44,12 +55,12 @@ def _parse_ddmmyyyy(value: str, name: str) -> date:
 
 def _period(day: str | None, date_from: str | None, date_to: str | None) -> tuple[date, date]:
     """Определяет период запроса: один день (date) или диапазон (from и to включительно)."""
-    if day and (date_from or date_to):
+    if day is not None and (date_from is not None or date_to is not None):
         raise HTTPException(400, "Укажите либо date, либо from и to, но не всё сразу")
-    if day:
+    if day is not None:
         d = _parse_ddmmyyyy(day, "date")
         return d, d
-    if date_from and date_to:
+    if date_from is not None and date_to is not None:
         start, end = _parse_ddmmyyyy(date_from, "from"), _parse_ddmmyyyy(date_to, "to")
         if end < start:
             raise HTTPException(400, "Дата to раньше даты from")
@@ -63,7 +74,7 @@ def _period(day: str | None, date_from: str | None, date_to: str | None) -> tupl
 def schedule(group: str, session: bool = False):
     """Сетка расписания группы как есть (по дням недели или датам сессии)."""
     data, lessons = _load(group, session)
-    return {"group": data.get("group", {}).get("title", group),
+    return {"group": (data.get("group") or {}).get("title") or group,
             "lessons": [l.to_dict() for l in lessons]}
 
 
@@ -104,7 +115,8 @@ def next_deadline(group: str, start: date | None = None):
     """Ближайший дедлайн в компактном виде + готовая фраза для озвучки на ESP32."""
     s = _day(start)
     _, lessons = _load(group, False)
-    found = find_deadlines(lessons, s, s + timedelta(days=60))
+    end = s + timedelta(days=min(60, (date.max - s).days))
+    found = find_deadlines(lessons, s, end)
     if not found:
         return {"deadline": None, "say": "Ближайших лабораторных и практик нет."}
     x = found[0]
