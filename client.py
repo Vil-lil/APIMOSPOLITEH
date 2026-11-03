@@ -2,6 +2,7 @@
 
 import re
 import time
+from threading import RLock
 from urllib.parse import quote
 
 import httpx
@@ -20,22 +21,35 @@ class ScheduleError(Exception):
     """Сайт не отдал расписание: группа не найдена или ответ не удалось разобрать."""
 
 
+class ScheduleSourceError(ScheduleError):
+    """Источник вернул ответ, который нельзя использовать как расписание."""
+
+
 class RaspClient:
     """Получает расписание групп с rasp.dmami.ru и кэширует ответы на cache_ttl секунд."""
 
-    def __init__(self, cache_ttl: int = 600, timeout: float = 15.0):
+    def __init__(self, cache_ttl: int = 600, timeout: float = 15.0, max_cache_entries: int = 128):
+        if cache_ttl < 0 or max_cache_entries < 1:
+            raise ValueError("TTL должен быть неотрицательным, а размер кэша положительным")
         self._http = httpx.Client(base_url=BASE_URL, headers=HEADERS, timeout=timeout)
         self._cache: dict[tuple[str, bool], tuple[float, dict]] = {}
         self._cache_ttl = cache_ttl
+        self._max_cache_entries = max_cache_entries
+        self._cache_lock = RLock()
 
     def get_group(self, group: str, session: bool = False) -> dict:
         """Сырой JSON расписания группы. session=True — расписание сессии."""
         key = (group, session)
-        cached = self._cache.get(key)
-        if cached and time.monotonic() - cached[0] < self._cache_ttl:
-            return cached[1]
+        with self._cache_lock:
+            now = time.monotonic()
+            expired = [k for k, (created, _) in self._cache.items() if now - created >= self._cache_ttl]
+            for expired_key in expired:
+                del self._cache[expired_key]
+            cached = self._cache.get(key)
+            if cached:
+                return cached[1]
 
-        url = f"/site/group?group={quote(group)}&session={int(session)}"
+        url = f"/site/group?group={quote(group, safe='')}&session={int(session)}"
         data = None
         for _ in range(3):
             resp = self._http.get(url)
@@ -46,12 +60,20 @@ class RaspClient:
             except ValueError:
                 match = BPC_RE.search(resp.text)
                 if not match:
-                    raise ScheduleError("Сайт вернул не JSON и без cookie bpc")
+                    raise ScheduleSourceError("Сайт вернул не JSON и без cookie bpc")
                 self._http.cookies.set("bpc", match.group(1), domain="rasp.dmami.ru")
         if data is None:
-            raise ScheduleError("Не удалось пройти защиту сайта (bpc)")
-        if data.get("status") not in (None, "ok") or "grid" not in data:
+            raise ScheduleSourceError("Не удалось пройти защиту сайта (bpc)")
+        if not isinstance(data, dict):
+            raise ScheduleSourceError("Ответ должен быть JSON-объектом")
+        if data.get("status") not in (None, "ok"):
             raise ScheduleError(data.get("message") or f"Группа {group} не найдена")
+        if "grid" not in data or (data["grid"] is not None and not isinstance(data["grid"], dict)):
+            raise ScheduleSourceError("Отсутствует корректная сетка grid")
 
-        self._cache[key] = (time.monotonic(), data)
+        with self._cache_lock:
+            # Повторный параллельный запрос к той же группе не должен вытеснять другую.
+            if key not in self._cache and len(self._cache) >= self._max_cache_entries:
+                del self._cache[next(iter(self._cache))]
+            self._cache[key] = (time.monotonic(), data)
         return data
